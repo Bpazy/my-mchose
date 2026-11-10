@@ -400,7 +400,7 @@ namespace MyMchose
                 int read = ReadOverlapped(buf, buf.Length, 500);
                 if (read <= 0) continue;
                 packets++;
-                Log.Write("[watch] " + Hex(buf, Math.Min(read, 40)));
+                Log.Write("[watch] " + Hex(buf, read));
                 MouseReading r = Parse(buf, read);
                 if (r.Ok) Log.Write("[watch] battery " + r.Battery + "% charging=" + r.Charging);
             }
