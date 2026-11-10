@@ -21,6 +21,11 @@ namespace MyMchose
         public int RefreshMinutes = 60;
         public bool StartWithWindows = false;
         public bool ShowTextOnIcon = true;
+        public bool ShowFloating = true;
+        public int FloatLeft = -1;
+        public int FloatTop = -1;
+        public int LastBattery = -1;
+        public string LastBatteryTime = "";
 
         private static string Dir
         {
@@ -45,6 +50,11 @@ namespace MyMchose
                 s.RefreshMinutes = ReadInt(json, "RefreshMinutes", 60);
                 s.StartWithWindows = ReadBool(json, "StartWithWindows", false);
                 s.ShowTextOnIcon = ReadBool(json, "ShowTextOnIcon", true);
+                s.ShowFloating = ReadBool(json, "ShowFloating", true);
+                s.FloatLeft = ReadInt(json, "FloatLeft", -1);
+                s.FloatTop = ReadInt(json, "FloatTop", -1);
+                s.LastBattery = ReadInt(json, "LastBattery", -1);
+                s.LastBatteryTime = ReadString(json, "LastBatteryTime", "");
                 if (s.RefreshMinutes < 1) s.RefreshMinutes = 1;
                 return s;
             }
@@ -59,7 +69,12 @@ namespace MyMchose
                 sb.AppendLine("{");
                 sb.AppendLine("  \"RefreshMinutes\": " + RefreshMinutes + ",");
                 sb.AppendLine("  \"StartWithWindows\": " + (StartWithWindows ? "true" : "false") + ",");
-                sb.AppendLine("  \"ShowTextOnIcon\": " + (ShowTextOnIcon ? "true" : "false"));
+                sb.AppendLine("  \"ShowTextOnIcon\": " + (ShowTextOnIcon ? "true" : "false") + ",");
+                sb.AppendLine("  \"ShowFloating\": " + (ShowFloating ? "true" : "false") + ",");
+                sb.AppendLine("  \"FloatLeft\": " + FloatLeft + ",");
+                sb.AppendLine("  \"FloatTop\": " + FloatTop + ",");
+                sb.AppendLine("  \"LastBattery\": " + LastBattery + ",");
+                sb.AppendLine("  \"LastBatteryTime\": \"" + (LastBatteryTime ?? "") + "\"");
                 sb.AppendLine("}");
                 File.WriteAllText(FilePath, sb.ToString(), Encoding.UTF8);
             }
@@ -77,6 +92,13 @@ namespace MyMchose
         {
             var m = System.Text.RegularExpressions.Regex.Match(json, "\"" + key + "\"\\s*:\\s*(true|false)");
             if (m.Success) return m.Groups[1].Value == "true";
+            return def;
+        }
+
+        private static string ReadString(string json, string key, string def)
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(json, "\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
+            if (m.Success) return m.Groups[1].Value;
             return def;
         }
     }
@@ -680,6 +702,137 @@ namespace MyMchose
     }
 
     // ------------------------------------------------------------------
+    // Floating readout (TrafficMonitor style)
+    // ------------------------------------------------------------------
+    internal sealed class BatteryForm : Form
+    {
+        private readonly Label _text;
+        private readonly Panel _dot;
+        private bool _dragging;
+        private Point _cursorStart;
+        private Point _windowStart;
+
+        public event EventHandler SettingsRequested;
+        public event EventHandler RefreshRequested;
+        public event EventHandler ExitRequested;
+        public event EventHandler PositionChanged;
+
+        public BatteryForm(int left, int top)
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            BackColor = Color.FromArgb(18, 18, 18);
+            ClientSize = new Size(104, 32);
+
+            _dot = new Panel();
+            _dot.SetBounds(10, 11, 10, 10);
+            _dot.BackColor = Color.Gray;
+            Controls.Add(_dot);
+
+            _text = new Label();
+            _text.AutoSize = false;
+            _text.SetBounds(26, 3, 70, 26);
+            _text.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
+            _text.ForeColor = Color.White;
+            _text.BackColor = Color.Transparent;
+            _text.Text = "--";
+            _text.TextAlign = ContentAlignment.MiddleLeft;
+            Controls.Add(_text);
+
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            if (left < 0 || top < 0)
+            {
+                Left = wa.Right - Width - 10;
+                Top = wa.Bottom - Height - 6;
+            }
+            else
+            {
+                Left = left;
+                Top = top;
+            }
+
+            Redouble(this);
+            Redouble(_text);
+            Redouble(_dot);
+
+            var menu = new ContextMenuStrip();
+            var refresh = new ToolStripMenuItem("立即刷新");
+            refresh.Click += delegate { if (RefreshRequested != null) RefreshRequested(this, EventArgs.Empty); };
+            var settings = new ToolStripMenuItem("设置…");
+            settings.Click += delegate { if (SettingsRequested != null) SettingsRequested(this, EventArgs.Empty); };
+            var hide = new ToolStripMenuItem("隐藏此窗口");
+            hide.Click += delegate { Hide(); };
+            var exit = new ToolStripMenuItem("退出");
+            exit.Click += delegate { if (ExitRequested != null) ExitRequested(this, EventArgs.Empty); };
+            menu.Items.Add(refresh);
+            menu.Items.Add(settings);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(hide);
+            menu.Items.Add(exit);
+            ContextMenuStrip = menu;
+            _text.ContextMenuStrip = menu;
+        }
+
+        private void Redouble(Control control)
+        {
+            control.MouseDown += OnDown;
+            control.MouseMove += OnMove;
+            control.MouseUp += OnUp;
+            control.DoubleClick += delegate { if (SettingsRequested != null) SettingsRequested(this, EventArgs.Empty); };
+        }
+
+        private void OnDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            _dragging = true;
+            _cursorStart = Cursor.Position;
+            _windowStart = Location;
+        }
+
+        private void OnMove(object sender, MouseEventArgs e)
+        {
+            if (!_dragging) return;
+            Point now = Cursor.Position;
+            Location = new Point(_windowStart.X + (now.X - _cursorStart.X), _windowStart.Y + (now.Y - _cursorStart.Y));
+        }
+
+        private void OnUp(object sender, MouseEventArgs e)
+        {
+            if (!_dragging) return;
+            _dragging = false;
+            if (PositionChanged != null) PositionChanged(this, EventArgs.Empty);
+        }
+
+        public void SetReading(int percent, bool charging)
+        {
+            if (percent < 0)
+            {
+                _text.Text = "--";
+                _dot.BackColor = Color.Gray;
+                return;
+            }
+            _text.Text = percent + "%" + (charging ? " ⚡" : "");
+            _dot.BackColor = percent <= 20 ? Color.FromArgb(220, 60, 60)
+                : percent <= 50 ? Color.FromArgb(230, 170, 40)
+                : Color.FromArgb(60, 170, 90);
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x08000000; // WS_EX_NOACTIVATE
+                return cp;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Tray application
     // ------------------------------------------------------------------
     internal sealed class TrayContext : ApplicationContext
@@ -693,6 +846,10 @@ namespace MyMchose
         private readonly System.Windows.Forms.Timer _pollTimer;
         private DateTime _lastUpdated = DateTime.MinValue;
         private int _seenVersion = -1;
+        private BatteryForm _float;
+        private ToolStripMenuItem _floatItem;
+        private int _lastBattery = -1;
+        private bool _lastCharging;
 
         public TrayContext()
         {
@@ -715,6 +872,18 @@ namespace MyMchose
             menu.Items.Add(_statusItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(_refreshItem);
+
+            _floatItem = new ToolStripMenuItem("显示悬浮电量窗");
+            _floatItem.CheckOnClick = true;
+            _floatItem.Checked = _settings.ShowFloating;
+            _floatItem.Click += delegate
+            {
+                _settings.ShowFloating = _floatItem.Checked;
+                _settings.Save();
+                ApplyFloating();
+            };
+            menu.Items.Add(_floatItem);
+
             menu.Items.Add(settingsItem);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(exitItem);
@@ -739,6 +908,43 @@ namespace MyMchose
 
             UpdateIcon(-1, false);
             _statusItem.Text = "正在连接鼠标…";
+
+            // Show the value from the previous run until the mouse reports a fresh one.
+            if (_settings.LastBattery >= 0)
+            {
+                _lastBattery = _settings.LastBattery;
+                UpdateIcon(_lastBattery, false);
+                _statusItem.Text = "电量 " + _lastBattery + "%（上次 " + _settings.LastBatteryTime + "）";
+                _icon.Text = Truncate("MCHOSE " + _lastBattery + "% · " + _settings.LastBatteryTime);
+            }
+
+            ApplyFloating();
+        }
+
+        private void ApplyFloating()
+        {
+            if (_settings.ShowFloating && _float == null)
+            {
+                _float = new BatteryForm(_settings.FloatLeft, _settings.FloatTop);
+                _float.SettingsRequested += delegate { OpenSettings(); };
+                _float.RefreshRequested += delegate { RefreshReading(true); };
+                _float.ExitRequested += delegate { ExitApplication(); };
+                _float.PositionChanged += delegate
+                {
+                    _settings.FloatLeft = _float.Left;
+                    _settings.FloatTop = _float.Top;
+                    _settings.Save();
+                };
+                _float.Show();
+            }
+            else if (!_settings.ShowFloating && _float != null)
+            {
+                _float.Close();
+                _float.Dispose();
+                _float = null;
+            }
+
+            if (_float != null) _float.SetReading(_lastBattery, _lastCharging);
         }
 
         private void ApplyInterval()
@@ -785,7 +991,13 @@ namespace MyMchose
             if (reading == null || !reading.Ok) return;
 
             _lastUpdated = DateTime.Now;
+            _lastBattery = reading.Battery;
+            _lastCharging = reading.Charging;
+            _settings.LastBattery = reading.Battery;
+            _settings.LastBatteryTime = _lastUpdated.ToString("HH:mm");
+            _settings.Save();
             UpdateIcon(reading.Battery, reading.Charging);
+            if (_float != null) _float.SetReading(reading.Battery, reading.Charging);
             _statusItem.Text = "电量 " + reading.Battery + "%" + (reading.Charging ? "（充电中）" : "");
             _icon.Text = Truncate("MCHOSE " + reading.Battery + "% · " + _lastUpdated.ToString("HH:mm"));
             Log.Write("[update] " + reading.Battery + "% charging=" + reading.Charging);
@@ -793,7 +1005,11 @@ namespace MyMchose
 
         private void UpdateIcon(int percent, bool charging)
         {
-            Icon newIcon = IconPainter.Create(percent, charging, _settings.ShowTextOnIcon, 32);
+            int size = SystemInformation.SmallIconSize.Width;
+            if (size < 16) size = 16;
+            // Digits are unreadable at 16 px; the floating window carries the number instead.
+            bool withText = _settings.ShowTextOnIcon && size >= 24;
+            Icon newIcon = IconPainter.Create(percent, charging, withText, size);
             Icon old = _icon.Icon;
             _icon.Icon = newIcon;
             if (old != null) old.Dispose();
@@ -810,6 +1026,7 @@ namespace MyMchose
             _timer.Stop();
             _pollTimer.Stop();
             _monitor.Stop();
+            if (_float != null) { _float.Close(); _float.Dispose(); _float = null; }
             _icon.Visible = false;
             _icon.Dispose();
             ExitThread();
@@ -818,9 +1035,14 @@ namespace MyMchose
 
     internal static class Program
     {
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDPIAware();
+
         [STAThread]
         private static void Main(string[] args)
         {
+            try { SetProcessDPIAware(); } catch { }
+
             if (args.Length > 0 && args[0] == "--watch")
             {
                 int seconds = args.Length > 1 ? int.Parse(args[1]) : 600;
