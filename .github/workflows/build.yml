@@ -1,0 +1,80 @@
+name: build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不带 v，留空则用 0.0.0-dev）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $refType = '${{ github.ref_type }}'
+          $refName = '${{ github.ref_name }}'
+          $inputVersion = '${{ github.event.inputs.version }}'
+          if ($refType -eq 'tag') {
+            $v = $refName
+          } elseif ($inputVersion) {
+            $v = $inputVersion
+          } else {
+            $v = '0.0.0-dev'
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "building version $v"
+
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1 -Version '${{ steps.ver.outputs.version }}'
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          # No mouse on the runner: watch mode must still start, find nothing and exit cleanly.
+          $p = Start-Process -FilePath .\bin\MyMchose.exe -ArgumentList '--watch','2' -PassThru -Wait
+          Write-Host "exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { throw "watch mode exited with $($p.ExitCode)" }
+          Get-Content (Join-Path $env:APPDATA 'MyMchose\app.log') -ErrorAction SilentlyContinue
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item bin\MyMchose.exe dist\
+          Copy-Item README.md, LICENSE dist\
+          Compress-Archive -Path dist\* -DestinationPath "MyMchose-${{ steps.ver.outputs.version }}-win-x64.zip" -Force
+          Get-ChildItem MyMchose-*.zip | Format-Table Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyMchose-${{ steps.ver.outputs.version }}
+          path: MyMchose-*.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: MyMchose ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            MyMchose-${{ steps.ver.outputs.version }}-win-x64.zip
+            bin/MyMchose.exe
