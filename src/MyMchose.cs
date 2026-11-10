@@ -213,6 +213,9 @@ namespace MyMchose
         private IntPtr _handle = IntPtr.Zero;
         private HidNative.HidpCaps _caps;
         private string _path = "";
+        private volatile bool _pingRequested = true;
+
+        public void RequestPing() { _pingRequested = true; }
 
         public ushort VendorId { get; private set; }
         public ushort ProductId { get; private set; }
@@ -363,6 +366,23 @@ namespace MyMchose
 
         private MouseReading Parse(byte[] data, int length)
         {
+            // Byte 0 is the HID report id (0x4D); the protocol payload starts at byte 1.
+            //
+            // Link status packet, sent when the mouse (re)connects:
+            //   01 01 0D 00 06 00 00 02 00 00 <battery> 00 ... 4F
+            // 0x0C instead of 0x0D means "disconnected".
+            for (int off = 1; off + 12 <= length; off++)
+            {
+                if (data[off] != 0x0D || data[off - 1] != 0x01) continue;
+                int level = data[off + 8];
+                if (level > 100) continue;
+                var link = new MouseReading();
+                link.Ok = true;
+                link.Battery = level;
+                link.Charging = false;
+                return link;
+            }
+
             // Battery status packet: command 0x0A, type 0x05, level 0-100, then
             // high nibble = full status, low nibble = charge status.
             for (int off = 0; off + 4 <= length; off++)
@@ -407,6 +427,28 @@ namespace MyMchose
             return packets;
         }
 
+        /// <summary>
+        /// Keeps the handle open and turns every reported battery packet into a sample.
+        /// </summary>
+        public void Pump(BatteryMonitor owner, Func<bool> stop)
+        {
+            byte[] buf = new byte[_caps.InputReportByteLength];
+            DateTime lastPing = DateTime.MinValue;
+            while (!stop())
+            {
+                if (_pingRequested || (DateTime.UtcNow - lastPing).TotalSeconds > 120)
+                {
+                    WriteOverlapped(BuildPingFrame(_caps.OutputReportByteLength), _caps.OutputReportByteLength, 500);
+                    _pingRequested = false;
+                    lastPing = DateTime.UtcNow;
+                }
+                int read = ReadOverlapped(buf, buf.Length, 500);
+                if (read <= 0) continue;
+                MouseReading r = Parse(buf, read);
+                if (r.Ok) owner.Publish(r);
+            }
+        }
+
         private static MouseReading Fail(string error)
         {
             return new MouseReading { Ok = false, Error = error };
@@ -418,6 +460,68 @@ namespace MyMchose
             for (int i = 0; i < count && i < data.Length; i++) sb.Append(data[i].ToString("X2")).Append(' ');
             return sb.ToString().Trim();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Persistent battery monitor
+    // ------------------------------------------------------------------
+    internal sealed class BatteryMonitor : IDisposable
+    {
+        private Thread _thread;
+        private volatile bool _stop;
+        private volatile MouseDevice _device;
+        private readonly object _gate = new object();
+        private MouseReading _latest;
+        private int _version;
+
+        public MouseReading Latest { get { lock (_gate) { return _latest; } } }
+        public int Version { get { lock (_gate) { return _version; } } }
+
+        public void Start()
+        {
+            _thread = new Thread(Loop);
+            _thread.IsBackground = true;
+            _thread.Start();
+        }
+
+        public void Stop() { _stop = true; }
+
+        /// <summary>Ask the worker to send a request frame; the receiver then reports its state.</summary>
+        public void Ping()
+        {
+            MouseDevice dev = _device;
+            if (dev != null) dev.RequestPing();
+        }
+
+        private void Loop()
+        {
+            while (!_stop)
+            {
+                try
+                {
+                    using (MouseDevice dev = MouseDevice.Open())
+                    {
+                        if (dev == null) { Thread.Sleep(10000); continue; }
+                        _device = dev;
+                        dev.Pump(this, delegate { return _stop; });
+                        _device = null;
+                    }
+                }
+                catch (Exception ex) { Log.Write("monitor: " + ex.Message); }
+                if (!_stop) Thread.Sleep(5000);
+            }
+        }
+
+        internal void Publish(MouseReading reading)
+        {
+            lock (_gate)
+            {
+                _latest = reading;
+                _version++;
+            }
+        }
+
+        public void Dispose() { Stop(); }
     }
 
     // ------------------------------------------------------------------
@@ -585,8 +689,10 @@ namespace MyMchose
         private readonly AppSettings _settings;
         private readonly ToolStripMenuItem _statusItem;
         private readonly ToolStripMenuItem _refreshItem;
-        private MouseReading _last;
+        private readonly BatteryMonitor _monitor;
+        private readonly System.Windows.Forms.Timer _pollTimer;
         private DateTime _lastUpdated = DateTime.MinValue;
+        private int _seenVersion = -1;
 
         public TrayContext()
         {
@@ -623,8 +729,16 @@ namespace MyMchose
             _timer.Tick += delegate { RefreshReading(false); };
             ApplyInterval();
 
+            _monitor = new BatteryMonitor();
+            _monitor.Start();
+
+            _pollTimer = new System.Windows.Forms.Timer();
+            _pollTimer.Interval = 1000;
+            _pollTimer.Tick += delegate { PollMonitor(); };
+            _pollTimer.Start();
+
             UpdateIcon(-1, false);
-            RefreshReading(true);
+            _statusItem.Text = "正在连接鼠标…";
         }
 
         private void ApplyInterval()
@@ -650,41 +764,31 @@ namespace MyMchose
         {
             try
             {
-                MouseReading reading;
-                using (MouseDevice dev = MouseDevice.Open())
-                {
-                    if (dev == null)
-                    {
-                        reading = new MouseReading { Ok = false, Error = "未找到 MCHOSE 设备" };
-                    }
-                    else
-                    {
-                        reading = dev.Read();
-                    }
-                }
-
-                _last = reading;
-                _lastUpdated = DateTime.Now;
-                Log.Write((manual ? "[manual] " : "[auto] ") + reading);
-
-                if (reading.Ok)
-                {
-                    UpdateIcon(reading.Battery, reading.Charging);
-                    _statusItem.Text = "电量 " + reading.Battery + "%" + (reading.Charging ? "（充电中）" : "");
-                    _icon.Text = Truncate("MCHOSE " + reading.Battery + "% · " + _lastUpdated.ToString("HH:mm"));
-                }
-                else
-                {
-                    UpdateIcon(-1, false);
-                    _statusItem.Text = "读取失败：" + reading.Error;
-                    _icon.Text = Truncate("MyMchose · 读取失败");
-                }
+                _monitor.Ping();
+                _statusItem.Text = "已请求刷新，等待设备上报…";
+                Log.Write(manual ? "[manual] ping" : "[auto] ping");
             }
             catch (Exception ex)
             {
                 Log.Write("refresh failed: " + ex);
-                _statusItem.Text = "读取异常：" + ex.Message;
+                _statusItem.Text = "刷新异常：" + ex.Message;
             }
+        }
+
+        private void PollMonitor()
+        {
+            int version = _monitor.Version;
+            if (version == _seenVersion) return;
+            _seenVersion = version;
+
+            MouseReading reading = _monitor.Latest;
+            if (reading == null || !reading.Ok) return;
+
+            _lastUpdated = DateTime.Now;
+            UpdateIcon(reading.Battery, reading.Charging);
+            _statusItem.Text = "电量 " + reading.Battery + "%" + (reading.Charging ? "（充电中）" : "");
+            _icon.Text = Truncate("MCHOSE " + reading.Battery + "% · " + _lastUpdated.ToString("HH:mm"));
+            Log.Write("[update] " + reading.Battery + "% charging=" + reading.Charging);
         }
 
         private void UpdateIcon(int percent, bool charging)
@@ -704,6 +808,8 @@ namespace MyMchose
         private void ExitApplication()
         {
             _timer.Stop();
+            _pollTimer.Stop();
+            _monitor.Stop();
             _icon.Visible = false;
             _icon.Dispose();
             ExitThread();
